@@ -1,86 +1,131 @@
+# Backend/app.py
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import chess
-import os
+import chess.pgn
+from typing import Optional, List, Dict
 import time
-from typing import Optional, List
+from pathlib import Path
 from engine_player import EnginePlayer
 
 app = FastAPI()
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Mount Frontend at both /static and /assets
+frontend_path = Path(__file__).parent.parent / "Frontend"
+app.mount("/static", StaticFiles(directory=str(frontend_path)), name="static")
+app.mount("/assets", StaticFiles(directory=str(frontend_path)), name="assets")
 
 # Game state
 board = chess.Board()
-engine_player = EnginePlayer()
-move_history_san: List[str] = []
+engine = EnginePlayer()
+
+# Clock state (seconds)
+clock_white = 300  # 5 minutes default
+clock_black = 300
+clock_paused = False
+last_switch_time = time.time()
+active_color = "white"  # who's currently on the clock
+
+# Player/engine colors
 player_color = "white"
 engine_color = "black"
 
-# Clock state
-clock_white = 300  # 5 minutes in seconds
-clock_black = 300
-active_color = "white"
-last_clock_update = time.time()
-clock_paused = False
 
-def reset_clocks(minutes: int = 5):
-    global clock_white, clock_black, last_clock_update, clock_paused, active_color
-    clock_white = minutes * 60
-    clock_black = minutes * 60
-    last_clock_update = time.time()
-    clock_paused = False
-    active_color = "white"
+class MoveRequest(BaseModel):
+    from_square: str
+    to_square: str
+    promotion: Optional[str] = None
 
-def update_active_clock():
-    global clock_white, clock_black, last_clock_update
-    if clock_paused:
+
+class ColorRequest(BaseModel):
+    color: str
+
+
+def _update_clock():
+    """Update the active clock based on elapsed time."""
+    global clock_white, clock_black, last_switch_time
+    
+    if clock_paused or board.is_game_over():
         return
-    now = time.time()
-    elapsed = now - last_clock_update
-    last_clock_update = now
+    
+    elapsed = time.time() - last_switch_time
+    
     if active_color == "white":
         clock_white = max(0, clock_white - elapsed)
     else:
         clock_black = max(0, clock_black - elapsed)
+    
+    last_switch_time = time.time()
 
-def switch_active_clock():
-    global active_color
-    update_active_clock()
-    active_color = "black" if active_color == "white" else "white"
 
-def get_state_dict():
-    update_active_clock()
-    turn_color = "white" if board.turn == chess.WHITE else "black"
+def _switch_clock():
+    """Switch active clock to the other side."""
+    global active_color, last_switch_time
+    
+    _update_clock()
+    active_color = "black" if board.turn == chess.BLACK else "white"
+    last_switch_time = time.time()
+
+
+def _get_captured_pieces() -> Dict[str, List[str]]:
+    """Calculate captured pieces based on material difference."""
+    white_pieces = {"p": 8, "n": 2, "b": 2, "r": 2, "q": 1}
+    black_pieces = {"p": 8, "n": 2, "b": 2, "r": 2, "q": 1}
+    
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            piece_symbol = piece.symbol().lower()
+            if piece.color == chess.WHITE:
+                if piece_symbol in white_pieces:
+                    white_pieces[piece_symbol] -= 1
+            else:
+                if piece_symbol in black_pieces:
+                    black_pieces[piece_symbol] -= 1
+    
+    captured_white = []
+    captured_black = []
+    
+    for piece_type, count in white_pieces.items():
+        captured_white.extend([piece_type.upper()] * count)
+    
+    for piece_type, count in black_pieces.items():
+        captured_black.extend([piece_type.lower()] * count)
+    
+    return {"white": captured_white, "black": captured_black}
+
+
+def _get_move_history() -> List[str]:
+    """Get move history in SAN notation."""
+    temp_board = chess.Board()
+    history = []
+    
+    for move in board.move_stack:
+        san = temp_board.san(move)
+        history.append(san)
+        temp_board.push(move)
+    
+    return history
+
+
+def _get_state() -> dict:
+    """Get complete game state."""
+    _update_clock()
+    
     result = None
     if board.is_game_over():
-        if board.is_checkmate():
-            result = "Black wins" if board.turn == chess.WHITE else "White wins"
-        elif board.is_stalemate():
-            result = "Draw (stalemate)"
-        elif board.is_insufficient_material():
-            result = "Draw (insufficient material)"
-        elif board.is_fifty_moves():
-            result = "Draw (50 moves)"
-        elif board.is_repetition():
-            result = "Draw (repetition)"
-        else:
-            result = "Draw"
+        outcome = board.outcome()
+        if outcome:
+            result = outcome.result()
+    
+    legal_moves = [move.uci() for move in board.legal_moves]
     
     return {
         "fen": board.fen(),
-        "turn": turn_color,
-        "move_history": move_history_san,
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        "move_history": _get_move_history(),
         "is_check": board.is_check(),
         "is_game_over": board.is_game_over(),
         "result": result,
@@ -90,172 +135,194 @@ def get_state_dict():
         },
         "active_color": active_color,
         "player_color": player_color,
-        "engine_color": engine_color
+        "engine_color": engine_color,
+        "legal_moves": legal_moves,
+        "captured": _get_captured_pieces()
     }
 
-class MoveRequest(BaseModel):
-    from_square: str
-    to_square: str
-    promotion: Optional[str] = None
-
-class ColorRequest(BaseModel):
-    color: str
-
-class ClockSetRequest(BaseModel):
-    minutes: int
-
-# Mount static files
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "Frontend")
-app.mount("/static", StaticFiles(directory=frontend_path), name="static")
-app.mount("/assets", StaticFiles(directory=frontend_path), name="assets")
 
 @app.get("/")
-async def serve_index():
-    index_path = os.path.join(frontend_path, "index.html")
-    return FileResponse(index_path)
+async def read_root():
+    return FileResponse(str(frontend_path / "index.html"))
+
 
 @app.get("/state")
 async def get_state():
-    return get_state_dict()
+    return _get_state()
+
 
 @app.get("/board")
 async def get_board():
-    state = get_state_dict()
-    legal_moves = [move.uci() for move in board.legal_moves]
-    state["legal_moves"] = legal_moves
-    return state
+    return _get_state()
+
 
 @app.post("/move")
-async def make_move(move_req: MoveRequest):
-    global move_history_san
+async def make_move(move_request: MoveRequest):
+    global board
     
+    if board.is_game_over():
+        raise HTTPException(status_code=400, detail="Game is over")
+    
+    current_turn = "white" if board.turn == chess.WHITE else "black"
+    if current_turn != player_color:
+        raise HTTPException(status_code=400, detail="Not your turn")
+    
+    # Parse move
     try:
-        from_sq = chess.parse_square(move_req.from_square)
-        to_sq = chess.parse_square(move_req.to_square)
-    except:
-        raise HTTPException(status_code=400, detail="Invalid square notation")
+        from_sq = chess.parse_square(move_request.from_square)
+        to_sq = chess.parse_square(move_request.to_square)
+        
+        # Check for promotion
+        promotion_piece = None
+        if move_request.promotion:
+            promotion_map = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
+            promotion_piece = promotion_map.get(move_request.promotion.lower())
+        
+        # Try to find the move
+        move = None
+        for legal_move in board.legal_moves:
+            if legal_move.from_square == from_sq and legal_move.to_square == to_sq:
+                if promotion_piece:
+                    if legal_move.promotion == promotion_piece:
+                        move = legal_move
+                        break
+                else:
+                    if legal_move.promotion is None:
+                        move = legal_move
+                        break
+        
+        if not move:
+            # If promotion is needed but not specified, default to queen
+            piece = board.piece_at(from_sq)
+            if piece and piece.piece_type == chess.PAWN:
+                rank = chess.square_rank(to_sq)
+                if (piece.color == chess.WHITE and rank == 7) or (piece.color == chess.BLACK and rank == 0):
+                    for legal_move in board.legal_moves:
+                        if legal_move.from_square == from_sq and legal_move.to_square == to_sq and legal_move.promotion == chess.QUEEN:
+                            move = legal_move
+                            break
+        
+        if not move:
+            raise HTTPException(status_code=400, detail="Illegal move")
+        
+        board.push(move)
+        _switch_clock()
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid move: {str(e)}")
     
-    # Check if it's player's turn
-    current_color = "white" if board.turn == chess.WHITE else "black"
-    if current_color != player_color:
-        raise HTTPException(status_code=400, detail="Not player's turn")
+    state = _get_state()
     
-    # Build move
-    promotion_piece = None
-    if move_req.promotion:
-        promotion_map = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
-        promotion_piece = promotion_map.get(move_req.promotion.lower())
+    # Engine response
+    engine_move_san = None
+    if not board.is_game_over() and board.turn == (chess.WHITE if engine_color == "white" else chess.BLACK):
+        engine_move = engine.best_move_for_board(board)
+        if engine_move:
+            engine_move_san = board.san(engine_move)
+            board.push(engine_move)
+            _switch_clock()
+            state = _get_state()
     
-    move = chess.Move(from_sq, to_sq, promotion=promotion_piece)
-    
-    # Validate legality
-    if move not in board.legal_moves:
-        raise HTTPException(status_code=400, detail="Illegal move")
-    
-    # Apply move
-    san = board.san(move)
-    board.push(move)
-    move_history_san.append(san)
-    switch_active_clock()
-    
-    # Engine reply if game not over
-    engine_move_made = None
-    if not board.is_game_over():
-        engine_turn_color = "white" if board.turn == chess.WHITE else "black"
-        if engine_turn_color == engine_color:
-            engine_move = engine_player.best_move_for_board(board)
-            if engine_move:
-                san_engine = board.san(engine_move)
-                board.push(engine_move)
-                move_history_san.append(san_engine)
-                engine_move_made = engine_move.uci()
-                switch_active_clock()
-    
-    state = get_state_dict()
-    state["engine_move"] = engine_move_made
+    state["engine_move"] = engine_move_san
     return state
+
 
 @app.get("/engine-move")
 async def engine_move():
-    global move_history_san
-    
     if board.is_game_over():
-        return get_state_dict()
+        raise HTTPException(status_code=400, detail="Game is over")
     
-    current_color = "white" if board.turn == chess.WHITE else "black"
-    if current_color != engine_color:
+    current_turn = "white" if board.turn == chess.WHITE else "black"
+    if current_turn != engine_color:
         raise HTTPException(status_code=400, detail="Not engine's turn")
     
-    move = engine_player.best_move_for_board(board)
+    move = engine.best_move_for_board(board)
     if move:
-        san = board.san(move)
         board.push(move)
-        move_history_san.append(san)
-        switch_active_clock()
+        _switch_clock()
     
-    return get_state_dict()
+    return _get_state()
+
 
 @app.get("/reset")
 async def reset_game():
-    global board, move_history_san
+    global board, clock_white, clock_black, active_color, last_switch_time, clock_paused
+    
     board = chess.Board()
-    move_history_san = []
-    reset_clocks()
+    clock_white = 300
+    clock_black = 300
+    active_color = "white"
+    last_switch_time = time.time()
+    clock_paused = False
     
     # If engine is white, make first move
     if engine_color == "white":
-        move = engine_player.best_move_for_board(board)
+        move = engine.best_move_for_board(board)
         if move:
-            san = board.san(move)
             board.push(move)
-            move_history_san.append(san)
-            switch_active_clock()
+            _switch_clock()
     
-    return get_state_dict()
+    return _get_state()
+
 
 @app.post("/set-player-color")
-async def set_player_color(color_req: ColorRequest):
-    global player_color, engine_color, board, move_history_san
+async def set_player_color(color_request: ColorRequest):
+    global player_color, engine_color, board, clock_white, clock_black, active_color, last_switch_time, clock_paused
     
-    if color_req.color not in ["white", "black"]:
+    if color_request.color not in ["white", "black"]:
         raise HTTPException(status_code=400, detail="Color must be 'white' or 'black'")
     
-    player_color = color_req.color
+    player_color = color_request.color
     engine_color = "black" if player_color == "white" else "white"
     
     # Reset game
     board = chess.Board()
-    move_history_san = []
-    reset_clocks()
+    clock_white = 300
+    clock_black = 300
+    active_color = "white"
+    last_switch_time = time.time()
+    clock_paused = False
     
     # If engine is white, make first move
     if engine_color == "white":
-        move = engine_player.best_move_for_board(board)
+        move = engine.best_move_for_board(board)
         if move:
-            san = board.san(move)
             board.push(move)
-            move_history_san.append(san)
-            switch_active_clock()
+            _switch_clock()
     
-    return get_state_dict()
+    return _get_state()
+
 
 @app.post("/clock/pause")
 async def pause_clock():
     global clock_paused
-    update_active_clock()
+    _update_clock()
     clock_paused = True
-    return {"status": "paused"}
+    return _get_state()
+
 
 @app.post("/clock/resume")
 async def resume_clock():
-    global clock_paused, last_clock_update
+    global clock_paused, last_switch_time
     clock_paused = False
-    last_clock_update = time.time()
-    return {"status": "resumed"}
+    last_switch_time = time.time()
+    return _get_state()
+
 
 @app.post("/clock/set/{minutes}")
 async def set_clock(minutes: int):
+    global clock_white, clock_black, last_switch_time
+    
     if minutes < 1 or minutes > 60:
         raise HTTPException(status_code=400, detail="Minutes must be between 1 and 60")
-    reset_clocks(minutes)
-    return get_state_dict()
+    
+    clock_white = minutes * 60
+    clock_black = minutes * 60
+    last_switch_time = time.time()
+    
+    return _get_state()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    engine.quit()
